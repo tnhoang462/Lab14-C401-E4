@@ -56,7 +56,7 @@ class LLMJudge:
         self.nvidia_model = os.getenv("NVIDIA_JUDGE_MODEL", "meta/llama-3.3-70b-instruct")
 
     # ──────────────────────────────────────────────────────────────────────────
-    #  Judge 1: OpenAI GPT-4o-mini
+    #  Judge 1: OpenAI GPT-4o
     # ──────────────────────────────────────────────────────────────────────────
     async def _judge_openai(self, question, answer, ground_truth):
         prompt = JUDGE_PROMPT.format(
