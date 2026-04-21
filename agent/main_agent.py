@@ -11,8 +11,11 @@ Deliverables:
 """
 
 import asyncio
+import re
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+
+from data.source_corpus import CORPUS
 
 # ---------------------------------------------------------------------------
 # Shared cost table (simulated, USD per 1 K tokens)
@@ -26,6 +29,65 @@ _COST_PER_1K = {
 def _compute_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
     table = _COST_PER_1K.get(model, _COST_PER_1K["gpt-4o-mini"])
     return (prompt_tokens / 1000) * table["in"] + (completion_tokens / 1000) * table["out"]
+
+
+# ---------------------------------------------------------------------------
+# Lightweight lexical retriever over the local corpus
+# ---------------------------------------------------------------------------
+# Vietnamese-aware stopword list + simple word-level overlap scoring. Good
+# enough to produce realistic hit/miss patterns for Hit Rate / MRR.
+
+_STOPWORDS = {
+    "và", "của", "các", "cho", "là", "có", "được", "để", "một", "những",
+    "tôi", "bạn", "khi", "nếu", "thì", "này", "đó", "phải", "trong", "ngoài",
+    "với", "từ", "đã", "sẽ", "đang", "về", "ra", "vào", "như", "làm", "gì",
+    "nào", "mỗi", "mỗi", "bao", "nhiêu", "ai", "hay", "hoặc", "không",
+    "hãy", "cần", "còn", "rồi", "thế", "ở", "tại", "theo", "trên", "dưới",
+    "sau", "trước", "đến", "nhưng", "mà", "chỉ", "cũng", "vì", "bởi",
+    "the", "a", "an", "of", "to", "in", "is", "are", "and", "or", "how",
+    "what", "when", "where", "why", "who", "do", "does", "can", "for",
+}
+
+
+def _tokenize(text: str) -> List[str]:
+    text = text.lower()
+    # Keep unicode letters + digits; drop punctuation.
+    text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
+    return [tok for tok in text.split() if tok and tok not in _STOPWORDS]
+
+
+def _score_doc(query_tokens: List[str], doc: Dict, title_weight: float = 1.0) -> float:
+    """Simple overlap score: sum of query-token hits in title (boosted) and content."""
+    title_tokens   = set(_tokenize(doc["title"]))
+    content_tokens = set(_tokenize(doc["content"]))
+    score = 0.0
+    for tok in query_tokens:
+        if tok in title_tokens:
+            score += 2.0 * title_weight
+        elif tok in content_tokens:
+            score += 1.0
+    return score
+
+
+def _retrieve_from_corpus(
+    question: str,
+    top_k: int = 3,
+    title_weight: float = 1.0,
+    min_score: float = 0.0,
+) -> Tuple[List[str], List[str], List[float]]:
+    """
+    Return (retrieved_ids, retrieved_contents, scores) ranked by overlap score.
+    Docs with score below `min_score` are filtered out (empty list possible → safety refusal).
+    """
+    q_tokens = _tokenize(question)
+    scored   = [(doc, _score_doc(q_tokens, doc, title_weight)) for doc in CORPUS]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    top = [(d, s) for d, s in scored[:top_k] if s > min_score]
+    return (
+        [d["id"] for d, _ in top],
+        [f"{d['title']}: {d['content']}" for d, _ in top],
+        [s for _, s in top],
+    )
 
 
 # ===========================================================================
@@ -59,24 +121,31 @@ class AgentV1:
             f"Trả lời:"
         )
 
-    async def _retrieve(self, question: str) -> List[str]:
-        """Simulate BM25 / dense retrieval with a fixed latency."""
+    async def _retrieve(self, question: str) -> Tuple[List[str], List[str]]:
+        """Top-2 lexical retrieval without title weighting (baseline)."""
         await asyncio.sleep(self._RETRIEVAL_DELAY_S)
-        return [
-            f"[V1-ctx1] Tài liệu liên quan đến '{question[:30]}...' — chính sách bảo hành 12 tháng.",
-            f"[V1-ctx2] Hướng dẫn đổi / trả trong vòng 30 ngày kể từ ngày mua.",
-        ]
+        ids, contents, _ = _retrieve_from_corpus(
+            question, top_k=2, title_weight=1.0, min_score=0.0
+        )
+        return ids, contents
 
-    async def _generate(self, prompt: str) -> Dict:
-        """Simulate an LLM call and return token/cost metadata."""
+    async def _generate(self, prompt: str, contexts: List[str]) -> Dict:
+        """Simulate an LLM call grounded in retrieved context."""
         await asyncio.sleep(self._LLM_DELAY_S)
-        prompt_tokens     = len(prompt.split()) + 50       # rough estimate
+        prompt_tokens     = len(prompt.split()) + 50
         completion_tokens = 120
         cost              = _compute_cost(self.MODEL, prompt_tokens, completion_tokens)
-        answer = (
-            f"Dựa trên tài liệu hệ thống, câu trả lời cho câu hỏi của bạn là: "
-            f"[Câu trả lời V1 — baseline]."
-        )
+
+        # Baseline "extraction": concatenate the first context verbatim.
+        # No refusal logic → fails on out-of-scope / adversarial cases.
+        if contexts:
+            snippet = contexts[0].split(":", 1)[-1].strip()
+            # Take first ~2 sentences so the answer is crisp but still derivative.
+            sentences = re.split(r"(?<=[\.\!\?])\s+", snippet)
+            answer    = " ".join(sentences[:2])
+        else:
+            answer = "Tôi không tìm thấy thông tin liên quan."
+
         return {
             "answer": answer,
             "model": self.MODEL,
@@ -86,23 +155,24 @@ class AgentV1:
         }
 
     async def query(self, question: str) -> Dict:
-        t0       = time.perf_counter()
-        contexts = await self._retrieve(question)
-        prompt   = self._build_prompt(question, contexts)
-        gen      = await self._generate(prompt)
-        latency  = time.perf_counter() - t0
+        t0                     = time.perf_counter()
+        retrieved_ids, contexts = await self._retrieve(question)
+        prompt                 = self._build_prompt(question, contexts)
+        gen                    = await self._generate(prompt, contexts)
+        latency                = time.perf_counter() - t0
 
         return {
             "answer":   gen["answer"],
             "contexts": contexts,
+            "retrieved_ids": retrieved_ids,
             "metadata": {
                 "version":            self.VERSION,
                 "model":              gen["model"],
+                "retrieved_ids":      retrieved_ids,
                 "prompt_tokens":      gen["prompt_tokens"],
                 "completion_tokens":  gen["completion_tokens"],
                 "cost_usd":           round(gen["cost_usd"], 6),
                 "latency_s":          round(latency, 4),
-                "sources":            ["policy_handbook.pdf", "faq.pdf"],
                 "cache_hit":          False,
             },
         }
@@ -145,25 +215,37 @@ class AgentV2:
             "Bước 3 — Câu trả lời cuối cùng:"
         )
 
-    async def _retrieve(self, question: str) -> List[str]:
-        """Simulate dense vector retrieval (top-3) with a faster index."""
-        await asyncio.sleep(self._RETRIEVAL_DELAY_S)
-        return [
-            f"[V2-ctx1] Chính sách bảo hành: 12 tháng cho phần cứng, 6 tháng cho phụ kiện.",
-            f"[V2-ctx2] Hướng dẫn đổi / trả: trong vòng 30 ngày, hàng còn nguyên đai nguyên kiện.",
-            f"[V2-ctx3] Liên hệ hỗ trợ: hotline 1800-xxxx, email support@company.vn.",
-        ]
+    # Safety / scope heuristics for Red Team cases
+    _REFUSAL_MIN_SCORE = 2.0   # if best-doc score below this → out-of-scope
+    _INJECTION_PATTERNS = [
+        r"quên (tất cả|mọi thứ|những gì)",
+        r"bỏ qua (chỉ thị|hướng dẫn)",
+        r"hệ thống prompt",
+        r"system prompt",
+        r"hướng dẫn nội bộ",
+        r"tiết lộ.*(hướng dẫn|prompt)",
+        r"đánh cắp",
+        r"mã nguồn (nội bộ|của)",
+        r"gửi.*mã nguồn",
+    ]
 
-    async def _generate_cached(self, question: str, prompt: str) -> Dict:
-        """Return cached response (simulated) with lower cost."""
-        await asyncio.sleep(0.05)   # cache lookup is near-instant
-        prompt_tokens     = len(prompt.split()) + 50
-        completion_tokens = 90      # shorter since answer is pre-cached
-        cost              = _compute_cost("cached", prompt_tokens, completion_tokens)
-        answer = (
-            f"[CACHE HIT] Câu trả lời cho '{question[:40]}...' "
-            f"đã được lưu trong bộ nhớ đệm ngữ nghĩa."
+    async def _retrieve(self, question: str) -> Tuple[List[str], List[str], List[float]]:
+        """Top-3 lexical retrieval with title boost (better recall)."""
+        await asyncio.sleep(self._RETRIEVAL_DELAY_S)
+        return _retrieve_from_corpus(
+            question, top_k=3, title_weight=2.0, min_score=0.5
         )
+
+    def _looks_like_injection(self, question: str) -> bool:
+        q = question.lower()
+        return any(re.search(p, q) for p in self._INJECTION_PATTERNS)
+
+    async def _generate_cached(self, question: str, prompt: str, answer: str) -> Dict:
+        """Return cached response (simulated) with lower cost."""
+        await asyncio.sleep(0.05)
+        prompt_tokens     = len(prompt.split()) + 50
+        completion_tokens = 90
+        cost              = _compute_cost("cached", prompt_tokens, completion_tokens)
         return {
             "answer": answer,
             "model": "cached",
@@ -173,17 +255,23 @@ class AgentV2:
             "cache_hit": True,
         }
 
-    async def _generate_llm(self, prompt: str) -> Dict:
-        """Full LLM call with CoT prompt."""
+    async def _generate_llm(self, prompt: str, contexts: List[str]) -> Dict:
+        """CoT-style LLM call grounded in retrieved context."""
         await asyncio.sleep(self._LLM_DELAY_S)
         prompt_tokens     = len(prompt.split()) + 50
-        completion_tokens = 100     # CoT responses slightly more token-efficient
+        completion_tokens = 100
         cost              = _compute_cost(self.MODEL, prompt_tokens, completion_tokens)
-        answer = (
-            "Bước 1 — Phân tích: câu hỏi liên quan đến chính sách hỗ trợ.\n"
-            "Bước 2 — Ngữ cảnh cho thấy thời hạn bảo hành 12 tháng và đổi trả 30 ngày.\n"
-            "Bước 3 — Câu trả lời: [Câu trả lời V2 — optimised, chain-of-thought]."
-        )
+
+        if not contexts:
+            answer = (
+                "Xin lỗi, câu hỏi này nằm ngoài phạm vi nội quy AcmeCorp mà tôi được "
+                "hỗ trợ. Vui lòng đặt câu hỏi về các chính sách nội bộ của công ty."
+            )
+        else:
+            snippet   = contexts[0].split(":", 1)[-1].strip()
+            sentences = re.split(r"(?<=[\.\!\?])\s+", snippet)
+            answer    = " ".join(sentences[:2])
+
         return {
             "answer": answer,
             "model": self.MODEL,
@@ -195,33 +283,53 @@ class AgentV2:
 
     async def query(self, question: str) -> Dict:
         import random
-        t0       = time.perf_counter()
-        contexts = await self._retrieve(question)
-        prompt   = self._build_prompt(question, contexts)
+        t0 = time.perf_counter()
 
-        # Simulate semantic cache hit
-        use_cache = random.random() < self._CACHE_HIT_RATE
-        if use_cache and question in self._cache:
-            gen = self._cache[question]
-        elif use_cache:
-            gen = await self._generate_cached(question, prompt)
-            self._cache[question] = gen
+        # Safety gate: prompt-injection / jailbreak refusal
+        if self._looks_like_injection(question):
+            retrieved_ids: List[str] = []
+            contexts: List[str]     = []
+            refusal = (
+                "Xin lỗi, tôi chỉ hỗ trợ các câu hỏi về nội quy và chính sách của "
+                "AcmeCorp. Tôi không thể xử lý yêu cầu bỏ qua hướng dẫn hệ thống "
+                "hoặc tiết lộ thông tin nội bộ."
+            )
+            gen = {
+                "answer": refusal,
+                "model": self.MODEL,
+                "prompt_tokens":      40,
+                "completion_tokens":  60,
+                "cost_usd": _compute_cost(self.MODEL, 40, 60),
+                "cache_hit": False,
+            }
         else:
-            gen = await self._generate_llm(prompt)
+            retrieved_ids, contexts, _scores = await self._retrieve(question)
+            prompt = self._build_prompt(question, contexts)
+
+            use_cache = random.random() < self._CACHE_HIT_RATE
+            if use_cache and question in self._cache:
+                gen = self._cache[question]
+            else:
+                gen = await self._generate_llm(prompt, contexts)
+                if use_cache:
+                    cached_gen = await self._generate_cached(question, prompt, gen["answer"])
+                    self._cache[question] = cached_gen
+                    gen = cached_gen
 
         latency = time.perf_counter() - t0
 
         return {
             "answer":   gen["answer"],
             "contexts": contexts,
+            "retrieved_ids": retrieved_ids,
             "metadata": {
                 "version":            self.VERSION,
                 "model":              gen["model"],
+                "retrieved_ids":      retrieved_ids,
                 "prompt_tokens":      gen["prompt_tokens"],
                 "completion_tokens":  gen["completion_tokens"],
                 "cost_usd":           round(gen["cost_usd"], 6),
                 "latency_s":          round(latency, 4),
-                "sources":            ["policy_handbook.pdf", "faq.pdf", "support_kb.pdf"],
                 "cache_hit":          gen.get("cache_hit", False),
             },
         }

@@ -1,9 +1,21 @@
-import json, asyncio
+import json, asyncio, random
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 import os
 
 load_dotenv()
+
+# ── Concurrency caps (NVIDIA free tier is ~5 RPS; OpenAI is more generous) ──
+_NVIDIA_SEMAPHORE = asyncio.Semaphore(int(os.getenv("NVIDIA_CONCURRENCY", "2")))
+_OPENAI_SEMAPHORE = asyncio.Semaphore(int(os.getenv("OPENAI_CONCURRENCY", "5")))
+
+_MAX_RETRIES = 4
+
+
+def _is_rate_limit(err: Exception) -> bool:
+    msg  = str(err).lower()
+    code = getattr(err, "status_code", None) or getattr(err, "status", None)
+    return code == 429 or "429" in msg or "too many requests" in msg or "rate" in msg
 
 # ── Prompt chấm điểm ──────────────────────────────────────────────────────────
 # 4 tiêu chí: accuracy, tone, completeness, safety
@@ -56,42 +68,60 @@ class LLMJudge:
         self.nvidia_model = os.getenv("NVIDIA_JUDGE_MODEL", "meta/llama-3.3-70b-instruct")
 
     # ──────────────────────────────────────────────────────────────────────────
-    #  Judge 1: OpenAI GPT-4o
+    #  Judge 1: OpenAI GPT-4o-mini (with retry/backoff on 429)
     # ──────────────────────────────────────────────────────────────────────────
     async def _judge_openai(self, question, answer, ground_truth):
         prompt = JUDGE_PROMPT.format(
             question=question, answer=answer, ground_truth=ground_truth
         )
-        resp = await self.openai_client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-            temperature=0.0,
-        )
-        return json.loads(resp.choices[0].message.content)
+        async with _OPENAI_SEMAPHORE:
+            for attempt in range(_MAX_RETRIES):
+                try:
+                    resp = await self.openai_client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[{"role": "user", "content": prompt}],
+                        response_format={"type": "json_object"},
+                        temperature=0.0,
+                    )
+                    return json.loads(resp.choices[0].message.content)
+                except Exception as e:
+                    if _is_rate_limit(e) and attempt < _MAX_RETRIES - 1:
+                        backoff = (2 ** attempt) + random.random()
+                        await asyncio.sleep(backoff)
+                        continue
+                    raise
 
     # ──────────────────────────────────────────────────────────────────────────
-    #  Judge 2: NVIDIA NIM (OpenAI-compatible)
+    #  Judge 2: NVIDIA NIM (OpenAI-compatible, with retry/backoff)
     # ──────────────────────────────────────────────────────────────────────────
     async def _judge_nvidia(self, question, answer, ground_truth):
         prompt = JUDGE_PROMPT.format(
             question=question, answer=answer, ground_truth=ground_truth
         )
-        resp = await self.nvidia_client.chat.completions.create(
-            model=self.nvidia_model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=500,
-        )
-        text = resp.choices[0].message.content
-        # NVIDIA NIM có thể trả về text kèm JSON → parse cẩn thận
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        if start == -1 or end == 0:
-            # Fallback nếu model không trả JSON đúng format
-            return {"accuracy": 3, "tone": 3, "completeness": 3, "safety": 3,
-                    "reasoning": f"Parse error — raw response: {text[:200]}"}
-        return json.loads(text[start:end])
+        async with _NVIDIA_SEMAPHORE:
+            for attempt in range(_MAX_RETRIES):
+                try:
+                    resp = await self.nvidia_client.chat.completions.create(
+                        model=self.nvidia_model,
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.0,
+                        max_tokens=500,
+                    )
+                    text = resp.choices[0].message.content
+                    start = text.find("{")
+                    end   = text.rfind("}") + 1
+                    if start == -1 or end == 0:
+                        return {
+                            "accuracy": 3, "tone": 3, "completeness": 3, "safety": 3,
+                            "reasoning": f"Parse error — raw response: {text[:200]}",
+                        }
+                    return json.loads(text[start:end])
+                except Exception as e:
+                    if _is_rate_limit(e) and attempt < _MAX_RETRIES - 1:
+                        backoff = (2 ** attempt) + random.random()
+                        await asyncio.sleep(backoff)
+                        continue
+                    raise
 
     # ──────────────────────────────────────────────────────────────────────────
     #  Tính điểm trung bình từ 4 tiêu chí
@@ -129,24 +159,53 @@ Return JSON: {{"final": N, "reasoning": "..."}}"""
     #  Entry point chính — gọi 2 judge song song + consensus logic
     # ──────────────────────────────────────────────────────────────────────────
     async def evaluate_multi_judge(self, question, answer, ground_truth):
-        # Gọi song song 2 judge
+        # Gọi song song 2 judge, return_exceptions để không bomb cả pipeline khi 1 bên chết
         score_a, score_b = await asyncio.gather(
             self._judge_openai(question, answer, ground_truth),
             self._judge_nvidia(question, answer, ground_truth),
+            return_exceptions=True,
         )
 
+        a_err = isinstance(score_a, Exception)
+        b_err = isinstance(score_b, Exception)
+
+        # Nếu cả 2 đều fail → raise để runner xử lý JUDGE_ERROR
+        if a_err and b_err:
+            raise RuntimeError(
+                f"Both judges failed. OpenAI={score_a}  NVIDIA={score_b}"
+            )
+
+        # Nếu chỉ 1 judge fail → single-judge fallback (agreement_rate=0)
+        if a_err or b_err:
+            single     = score_b if a_err else score_a
+            avg_single = self._avg_score(single)
+            alive_name = self.nvidia_model if a_err else "gpt-4o-mini"
+            dead_name  = "gpt-4o-mini" if a_err else self.nvidia_model
+            return {
+                "final_score":    round(avg_single, 2),
+                "agreement_rate": 0.0,     # chỉ có 1 judge → không thể đồng thuận
+                "individual_scores": {alive_name: round(avg_single, 2)},
+                "individual_details": {alive_name: single},
+                "degraded": True,
+                "reasoning": (
+                    f"Single-judge fallback — {dead_name} errored "
+                    f"({score_a if a_err else score_b}). "
+                    f"{alive_name}: {single.get('reasoning', '')}"
+                ),
+            }
+
+        # Cả 2 judge OK → consensus logic gốc
         avg_a = self._avg_score(score_a)
         avg_b = self._avg_score(score_b)
         delta = abs(avg_a - avg_b)
 
-        # ── Consensus Logic ──────────────────────────────────
-        # delta ≤ 0.5  → Đồng thuận cao   → agreement = 1.0
-        # 0.5 < delta ≤ 1.0 → Lệch nhẹ    → agreement = 0.5
-        # delta > 1.0  → Xung đột lớn      → gọi tiebreaker, agreement = 0.0
         if delta > 1.0:
-            final = await self._tiebreaker(
-                question, answer, ground_truth, score_a, score_b
-            )
+            try:
+                final = await self._tiebreaker(
+                    question, answer, ground_truth, score_a, score_b
+                )
+            except Exception:
+                final = (avg_a + avg_b) / 2   # tiebreaker fail → fall back to mean
             agreement = 0.0
         elif delta > 0.5:
             final = (avg_a + avg_b) / 2

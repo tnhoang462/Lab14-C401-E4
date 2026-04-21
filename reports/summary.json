@@ -1,0 +1,79 @@
+{
+  "metadata": {
+    "version": "Agent_V2_Optimized",
+    "total": 57,
+    "timestamp": "2026-04-21 18:03:07",
+    "dataset": "data/golden_set.jsonl"
+  },
+  "metrics": {
+    "avg_score": 3.9298,
+    "hit_rate": 0.8421,
+    "mrr": 0.7719,
+    "agreement_rate": 0.2193,
+    "avg_cost_usd": 9e-05,
+    "avg_latency_s": 0.5477,
+    "pass": 43,
+    "fail": 9,
+    "error": 0,
+    "needs_review": 5,
+    "total": 57
+  },
+  "v1_metrics": {
+    "avg_score": 3.9693,
+    "hit_rate": 0.8421,
+    "mrr": 0.807,
+    "agreement_rate": 0.0,
+    "avg_cost_usd": 0.000104,
+    "avg_latency_s": 0.8095,
+    "pass": 45,
+    "fail": 8,
+    "error": 0,
+    "needs_review": 4,
+    "total": 57
+  },
+  "regression": {
+    "v1_summary": {
+      "version": "v1",
+      "name": "SupportAgent-V1-Baseline",
+      "total_cases": 57,
+      "elapsed_s": 646.07,
+      "metrics": {
+        "avg_score": 3.9693,
+        "avg_hit_rate": 0.8421,
+        "avg_cost_usd": 0.000104,
+        "avg_latency_s": 0.810782,
+        "agreement_rate": 0.0
+      }
+    },
+    "v2_summary": {
+      "version": "v2",
+      "name": "SupportAgent-V2-Optimized",
+      "total_cases": 57,
+      "elapsed_s": 652.72,
+      "metrics": {
+        "avg_score": 3.9298,
+        "avg_hit_rate": 0.8421,
+        "avg_cost_usd": 9e-05,
+        "avg_latency_s": 0.548389,
+        "agreement_rate": 0.2193
+      }
+    },
+    "delta_analysis": {
+      "avg_score": -0.0395,
+      "avg_hit_rate": 0.0,
+      "avg_cost_usd": -1.4e-05,
+      "avg_latency_s": -0.262393,
+      "agreement_rate": 0.2193
+    },
+    "release_gate": {
+      "decision": "ROLLBACK",
+      "reason": "V2 quality < V1 (Δscore=-0.0395 < 0.0). Quality regression detected.",
+      "score_delta": -0.0395,
+      "cost_change_pct": -13.46,
+      "thresholds_used": {
+        "min_quality_delta": 0.0,
+        "max_cost_increase_pct": 20
+      }
+    }
+  }
+}
