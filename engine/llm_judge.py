@@ -28,7 +28,7 @@ Return ONLY JSON with no other text:
 class LLMJudge:
     """
     Multi-Judge sử dụng 2 model:
-      - Judge 1: OpenAI GPT-4o-mini
+      - Judge 1: OpenAI GPT-4o
       - Judge 2: NVIDIA NIM (ví dụ: meta/llama-3.3-70b-instruct)
 
     NVIDIA NIM cung cấp OpenAI-compatible API, nên ta dùng lại
@@ -63,7 +63,7 @@ class LLMJudge:
             question=question, answer=answer, ground_truth=ground_truth
         )
         resp = await self.openai_client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
             temperature=0.0,
@@ -106,7 +106,7 @@ class LLMJudge:
     async def _tiebreaker(self, question, answer, ground_truth, score_a, score_b):
         """Khi 2 judge lệch > 1 điểm, gọi lại model mạnh hơn với context cả 2 bên."""
         prompt = f"""Two judges scored this response differently.
-Judge A (GPT-4o-mini): {json.dumps(score_a)}
+Judge A (GPT-4o): {json.dumps(score_a)}
 Judge B ({self.nvidia_model}): {json.dumps(score_b)}
 
 Question: {question}
@@ -189,13 +189,13 @@ Return JSON: {{"final": N, "reasoning": "..."}}"""
 
         result_ab, result_ba = await asyncio.gather(
             self.openai_client.chat.completions.create(
-                model="gpt-4o-mini",
+                model="gpt-4o",
                 messages=[{"role": "user", "content": prompt_ab}],
                 response_format={"type": "json_object"},
                 temperature=0.0,
             ),
             self.openai_client.chat.completions.create(
-                model="gpt-4o-mini",
+                model="gpt-4o",
                 messages=[{"role": "user", "content": prompt_ba}],
                 response_format={"type": "json_object"},
                 temperature=0.0,
